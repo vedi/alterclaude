@@ -311,11 +311,14 @@ collect_account_uuids() {
   done
   shopt -u nullglob
   if [ -d "$SESSIONS_DIR" ]; then
+    shopt -s nullglob
     for d in "$SESSIONS_DIR"/*; do
       [ -e "$d" ] || continue
       basename "$d"
     done
+    shopt -u nullglob
   fi
+  return 0
 }
 
 pick_canonical_uuid() {
