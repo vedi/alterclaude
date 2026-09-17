@@ -1,0 +1,28 @@
+# build
+dist/
+*.tar.gz
+.DS_Store
+
+# never ship Claude identity — even if dropped into this tree by mistake
+work/
+personal/
+.active
+code-sessions-canonical
+backups/
+Cookies
+Cookies-journal
+config.json
+Local Storage/
+Session Storage/
+WebStorage/
+IndexedDB/
+Partitions/
+ant-did
+ant-device-registry.json
+buddy-tokens.json
+*.bak
+.env
+.env.*
+*.pem
+*.key
+credentials.json

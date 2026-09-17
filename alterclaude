@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# alterclaude — переключение аккаунтов Claude Desktop (macOS + Linux)
+# Меняет местами только «личность» аккаунта.
+# Общими остаются: MCP-конфиг, vm_bundles, кэш, ~/.claude/projects
+set -euo pipefail
+
+PROFILES_DIR="${CLAUDE_PROFILES_DIR:-$HOME/.claude-profiles}"
+ACTIVE_FILE="$PROFILES_DIR/.active"
+CANON_FILE="$PROFILES_DIR/code-sessions-canonical"
+
+IDENTITY=(
+  "Cookies"
+  "Cookies-journal"
+  "config.json"
+  "Local Storage"
+  "Session Storage"
+  "WebStorage"
+  "IndexedDB"
+  "ant-did"
+  "ant-device-registry.json"
+  "buddy-tokens.json"
+  "Partitions"
+)
+
+DRY=0
+YES=0
+SHARE_CODE="${CLAUDE_SWAP_SHARE_CODE:-1}"
+
+c_b=$'\033[1m'; c_r=$'\033[31m'; c_g=$'\033[32m'; c_y=$'\033[33m'; c_0=$'\033[0m'
+
+die()  { printf '%sОшибка:%s %s\n' "$c_r" "$c_0" "$*" >&2; exit 1; }
+step() { printf '%s==>%s %s\n' "$c_b" "$c_0" "$*"; }
+info() { printf '    %s\n' "$*"; }
+run()  { if [ "$DRY" = 1 ]; then printf '    %s[dry-run]%s %s\n' "$c_y" "$c_0" "$*"; else "$@"; fi; }
+
+detect_os() {
+  case "$(uname -s)" in
+    Darwin) OS=darwin ;;
+    Linux)  OS=linux ;;
+    *)      die "ОС не поддерживается: $(uname -s). Нужны macOS или Linux." ;;
+  esac
+}
+
+default_claude_dir() {
+  case "$OS" in
+    darwin) printf '%s' "$HOME/Library/Application Support/Claude" ;;
+    linux)  printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/Claude" ;;
+  esac
+}
+
+init_paths() {
+  detect_os
+  if [ -z "${CLAUDE_DIR:-}" ]; then
+    CLAUDE_DIR="$(default_claude_dir)"
+  fi
+  SESSIONS_DIR="$CLAUDE_DIR/claude-code-sessions"
+}
+
+# --- процессы приложения -----------------------------------------------------
+# Не pkill -f Claude: паттерн зацепит постороннее.
+# Не ждать chrome-native-host: это Chrome, цикл зависнет.
+is_claude_desktop_cmd() {
+  local cmd="$1"
+  case "$cmd" in
+    *chrome-native-host*|*claude-swap*|*alterclaude*|*pgrep*|*grep*) return 1 ;;
+  esac
+  case "$cmd" in
+    */Applications/Claude.app/*) return 0 ;;
+    *claude-desktop*) return 0 ;;
+    */usr/lib/claude-desktop/*) return 0 ;;
+    */opt/claude-desktop/*) return 0 ;;
+    */opt/Claude/*) return 0 ;;
+  esac
+  if [ -n "${CLAUDE_BIN:-}" ]; then
+    case "$cmd" in *"$CLAUDE_BIN"*) return 0 ;; esac
+  fi
+  return 1
+}
+
+app_pids() {
+  local pid cmd
+  while read -r pid cmd; do
+    [ -n "${pid:-}" ] || continue
+    if is_claude_desktop_cmd "$cmd"; then
+      printf '%s\n' "$pid"
+    fi
+  done < <(ps -eo pid= -o args= 2>/dev/null || true)
+}
+
+wait_app_exit() {
+  local i
+  for i in $(seq 1 60); do
+    if [ -z "$(app_pids)" ]; then
+      info "завершилось за $((i / 2)).$(( (i * 5) % 10 )) сек"
+      sleep 1
+      return
+    fi
+    sleep 0.5
+  done
+  die "приложение не завершилось за 30 сек. Закройте вручную и повторите."
+}
+
+quit_app_darwin() {
+  osascript -e 'quit app "Claude"' >/dev/null 2>&1 || true
+}
+
+quit_app_linux() {
+  local pid
+  for pid in $(app_pids); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+}
+
+quit_app() {
+  if [ -z "$(app_pids)" ]; then
+    info "приложение уже закрыто"
+    return
+  fi
+  step "Закрываю Claude Desktop"
+  if [ "$DRY" = 1 ]; then
+    info "${c_y}[dry-run]${c_0} quit + ожидание выхода"
+    return
+  fi
+  case "$OS" in
+    darwin) quit_app_darwin ;;
+    linux)  quit_app_linux ;;
+  esac
+  wait_app_exit
+}
+
+resolve_claude_bin() {
+  local c
+  if [ -n "${CLAUDE_BIN:-}" ]; then
+    printf '%s' "$CLAUDE_BIN"
+    return 0
+  fi
+  if command -v claude-desktop >/dev/null 2>&1; then
+    command -v claude-desktop
+    return 0
+  fi
+  for c in \
+    /usr/lib/claude-desktop/claude-desktop \
+    /opt/claude-desktop/claude-desktop \
+    /opt/Claude/claude-desktop \
+    /usr/bin/claude-desktop
+  do
+    if [ -x "$c" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+start_app_linux() {
+  local bin desktop
+  if [ "$DRY" = 1 ]; then
+    if bin="$(resolve_claude_bin)"; then
+      info "${c_y}[dry-run]${c_0} $bin &"
+    else
+      info "${c_y}[dry-run]${c_0} gtk-launch com.anthropic.Claude"
+    fi
+    return
+  fi
+  if bin="$(resolve_claude_bin)"; then
+    nohup "$bin" >/dev/null 2>&1 &
+    return
+  fi
+  for desktop in com.anthropic.Claude claude-desktop Claude; do
+    if command -v gtk-launch >/dev/null 2>&1 \
+      && { [ -f "/usr/share/applications/${desktop}.desktop" ] \
+        || [ -f "$HOME/.local/share/applications/${desktop}.desktop" ]; }
+    then
+      gtk-launch "$desktop" >/dev/null 2>&1 || true
+      return
+    fi
+  done
+  die "не найден claude-desktop. Поставь пакет или задай CLAUDE_BIN=/path/to/bin"
+}
+
+start_app() {
+  step "Запускаю Claude Desktop"
+  case "$OS" in
+    darwin) run open -a "Claude" ;;
+    linux)  start_app_linux ;;
+  esac
+}
+
+# --- работа с профилями ------------------------------------------------------
+active_profile() { [ -f "$ACTIVE_FILE" ] && cat "$ACTIVE_FILE" || echo ""; }
+
+backup() {
+  local dest="$PROFILES_DIR/backups/$(date +%Y%m%d-%H%M%S)"
+  step "Бэкап текущей личности"
+  run mkdir -p "$dest"
+  local item
+  for item in "${IDENTITY[@]}"; do
+    if [ -e "$CLAUDE_DIR/$item" ]; then
+      run cp -R "$CLAUDE_DIR/$item" "$dest/"
+    fi
+  done
+  info "→ $dest"
+}
+
+stash_to() {
+  local dest="$PROFILES_DIR/$1"
+  step "Сохраняю текущий аккаунт в профиль «$1»"
+  run mkdir -p "$dest"
+  local item n=0
+  for item in "${IDENTITY[@]}"; do
+    if [ -e "$CLAUDE_DIR/$item" ]; then
+      run rm -rf "$dest/$item"
+      run mv "$CLAUDE_DIR/$item" "$dest/$item"
+      n=$((n+1))
+    fi
+  done
+  info "перенесено объектов: $n"
+}
+
+restore_from() {
+  local src="$PROFILES_DIR/$1"
+  local item n=0
+  for item in "${IDENTITY[@]}"; do
+    if [ -e "$src/$item" ]; then
+      run mv "$src/$item" "$CLAUDE_DIR/$item"
+      n=$((n+1))
+    fi
+  done
+  if [ "$n" = 0 ]; then
+    step "Профиль «$1» пуст — приложение откроется на экране логина"
+  else
+    step "Подставлен профиль «$1» (объектов: $n)"
+  fi
+}
+
+read_account_uuid() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  python3 -c 'import json,sys
+print(json.load(open(sys.argv[1])).get("lastKnownAccountUuid") or "")' "$file" 2>/dev/null || true
+}
+
+collect_account_uuids() {
+  local u file d
+  u="$(read_account_uuid "$CLAUDE_DIR/config.json")"
+  [ -n "${u:-}" ] && printf '%s\n' "$u"
+  for file in "$PROFILES_DIR"/*/config.json; do
+    [ -f "$file" ] || continue
+    u="$(read_account_uuid "$file")"
+    [ -n "${u:-}" ] && printf '%s\n' "$u"
+  done
+  if [ -d "$SESSIONS_DIR" ]; then
+    for d in "$SESSIONS_DIR"/*; do
+      [ -e "$d" ] || continue
+      basename "$d"
+    done
+  fi
+}
+
+pick_canonical_uuid() {
+  local best="" bestn=-1 name n d
+  if [ -f "$CANON_FILE" ]; then
+    cat "$CANON_FILE"
+    return
+  fi
+  [ -d "$SESSIONS_DIR" ] || return 0
+  for d in "$SESSIONS_DIR"/*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    name="$(basename "$d")"
+    n="$(find "$d" -name 'local_*.json' 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$n" -gt "$bestn" ]; then
+      bestn=$n
+      best=$name
+    fi
+  done
+  printf '%s' "$best"
+}
+
+ensure_shared_code_sessions() {
+  local canon dest rel u bak
+  [ "$SHARE_CODE" = 1 ] || return 0
+  [ -d "$SESSIONS_DIR" ] || return 0
+  canon="$(pick_canonical_uuid)"
+  [ -n "$canon" ] || return 0
+  [ -e "$SESSIONS_DIR/$canon" ] || return 0
+  if [ "$DRY" = 0 ] && [ ! -f "$CANON_FILE" ]; then
+    echo "$canon" > "$CANON_FILE"
+  fi
+  step "Общие сессии Code → $canon"
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    [ "$u" = "$canon" ] && continue
+    dest="$SESSIONS_DIR/$u"
+    if [ -L "$dest" ]; then
+      rel="$(readlink "$dest")"
+      if [ "$rel" = "$canon" ]; then
+        info "symlink $u → $canon уже есть"
+        continue
+      fi
+    fi
+    if [ -e "$dest" ]; then
+      bak="$PROFILES_DIR/backups/$(date +%Y%m%d-%H%M%S)-code-sessions-$u"
+      run mkdir -p "$bak"
+      run mv "$dest" "$bak/"
+      info "бэкап сессий $u → $bak"
+    fi
+    run ln -s "$canon" "$dest"
+    info "symlink $u → $canon"
+  done < <(collect_account_uuids | sort -u)
+}
+
+cmd_list() {
+  local active; active="$(active_profile)"
+  printf '%sПрофили:%s  (%s  %s)\n' "$c_b" "$c_0" "$OS" "$CLAUDE_DIR"
+  local found=0 d name mark size
+  for d in "$PROFILES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    [ "$name" = "backups" ] && continue
+    found=1
+    if [ "$name" = "$active" ]; then mark="${c_g}● активен${c_0}"; else mark="  "; fi
+    size="$(du -sh "$d" 2>/dev/null | cut -f1)"
+    printf '  %-14s %6s  %b\n' "$name" "$size" "$mark"
+  done
+  [ "$found" = 0 ] && printf '  (пусто — начните с: alterclaude init <имя>)\n'
+  [ -n "$active" ] && printf '\nАктивный: %s%s%s\n' "$c_g" "$active" "$c_0"
+  return 0
+}
+
+cmd_init() {
+  local name="$1"
+  [ -n "$name" ] || die "укажите имя: alterclaude init personal"
+  [ -f "$ACTIVE_FILE" ] && die "уже инициализировано (активен: $(active_profile))"
+  run mkdir -p "$PROFILES_DIR/$name"
+  if [ "$DRY" = 0 ]; then echo "$name" > "$ACTIVE_FILE"; fi
+  step "Текущий аккаунт помечен как профиль «$name»"
+  info "файлы не трогались — личность остаётся на месте"
+  info "дальше: alterclaude <другое-имя> создаст новый профиль и покажет логин"
+}
+
+cmd_doctor() {
+  local bin="" pids
+  printf '%sdoctor%s\n' "$c_b" "$c_0"
+  info "OS: $OS"
+  info "CLAUDE_DIR: $CLAUDE_DIR $([ -d "$CLAUDE_DIR" ] && echo OK || echo MISSING)"
+  info "PROFILES_DIR: $PROFILES_DIR"
+  if command -v python3 >/dev/null 2>&1; then info "python3: OK"; else info "python3: MISSING"; fi
+  if [ "$OS" = linux ]; then
+    if bin="$(resolve_claude_bin)"; then
+      info "CLAUDE_BIN: $bin"
+    else
+      info "CLAUDE_BIN: не найден (задайте CLAUDE_BIN)"
+    fi
+  else
+    info "app: /Applications/Claude.app $([ -d /Applications/Claude.app ] && echo OK || echo MISSING)"
+  fi
+  pids="$(app_pids | tr '\n' ' ')"
+  if [ -n "$pids" ]; then info "running PIDs: $pids"; else info "running: нет"; fi
+  if [ -n "${CLAUDE_CODE_DESKTOP_APP_VERSION:-}" ]; then
+    info "WARNING: запущено изнутри Claude Desktop — switch запрещён"
+  fi
+}
+
+cmd_switch() {
+  local target="$1"
+  local active; active="$(active_profile)"
+
+  if [ -n "${CLAUDE_CODE_DESKTOP_APP_VERSION:-}" ] && [ "$DRY" = 0 ]; then
+    die "запущено изнутри Claude Desktop. Откройте обычный терминал:
+         alterclaude $target"
+  fi
+
+  [ -n "$active" ] || die "сначала выполните: alterclaude init <имя-текущего-аккаунта>"
+  [ "$target" = "$active" ] && { step "Профиль «$target» уже активен"; return 0; }
+  [ -d "$CLAUDE_DIR" ] || die "не найдена папка приложения: $CLAUDE_DIR
+         Задайте CLAUDE_DIR, если данные лежат в другом месте."
+
+  if [ ! -d "$PROFILES_DIR/$target" ] && [ "$YES" = 0 ] && [ "$DRY" = 0 ]; then
+    printf 'Профиль «%s» не существует. Создать новый (будет экран логина)? [y/N] ' "$target"
+    read -r a; [ "$a" = "y" ] || [ "$a" = "Y" ] || die "отменено"
+  fi
+
+  if [ "$YES" = 0 ] && [ "$DRY" = 0 ]; then
+    printf '%sВнимание:%s приложение будет закрыто, активные сессии Claude Code прервутся. Продолжить? [y/N] ' "$c_y" "$c_0"
+    read -r a; [ "$a" = "y" ] || [ "$a" = "Y" ] || die "отменено"
+  fi
+
+  quit_app
+  backup
+  stash_to "$active"
+  restore_from "$target"
+  if [ "$DRY" = 0 ]; then echo "$target" > "$ACTIVE_FILE"; fi
+  ensure_shared_code_sessions
+  start_app
+  printf '\n%s✓ Переключено: %s → %s%s\n' "$c_g" "$active" "$target" "$c_0"
+}
+
+usage() {
+  cat <<'USAGE'
+alterclaude — переключение аккаунтов Claude Desktop (macOS + Linux)
+
+  alterclaude init <имя>     пометить текущий аккаунт как профиль (первый шаг)
+  alterclaude <имя>          переключиться на профиль (создаст, если нет)
+  alterclaude list           показать профили
+  alterclaude status         то же, что list
+  alterclaude doctor         пути, бинарь, запущен ли Desktop
+
+Флаги:
+  --dry-run         показать, что будет сделано, ничего не меняя
+  --yes             не спрашивать подтверждений
+  --no-share-code   не склеивать списки вкладки Code symlink-ом
+
+Переменные:
+  CLAUDE_DIR              папка данных Desktop
+                          macOS:  ~/Library/Application Support/Claude
+                          Linux:  ${XDG_CONFIG_HOME:-~/.config}/Claude
+  CLAUDE_BIN              бинарь Desktop на Linux (иначе claude-desktop)
+  CLAUDE_PROFILES_DIR     каталог профилей (по умолчанию ~/.claude-profiles)
+  CLAUDE_SWAP_SHARE_CODE  0/1, шарить сессии Code (по умолчанию 1)
+
+Установка: ./install.sh  (команда alterclaude в ~/.local/bin).
+Данные профилей в ~/.claude-profiles на другую машину не копировать.
+USAGE
+}
+
+# --- разбор аргументов -------------------------------------------------------
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --yes|-y)  YES=1 ;;
+    --no-share-code) SHARE_CODE=0 ;;
+    -h|--help) usage; exit 0 ;;
+    *)         ARGS+=("$a") ;;
+  esac
+done
+[ "${#ARGS[@]}" -gt 0 ] || { usage; exit 0; }
+
+init_paths
+
+case "${ARGS[0]}" in
+  list|status) cmd_list ;;
+  init)        cmd_init "${ARGS[1]:-}" ;;
+  doctor)      cmd_doctor ;;
+  *)           cmd_switch "${ARGS[0]}" ;;
+esac
