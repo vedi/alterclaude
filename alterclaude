@@ -41,18 +41,39 @@ detect_os() {
   esac
 }
 
-default_claude_dir() {
-  case "$OS" in
-    darwin) printf '%s' "$HOME/Library/Application Support/Claude" ;;
-    linux)  printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/Claude" ;;
-  esac
+linux_data_dirs() {
+  local root="${XDG_CONFIG_HOME:-$HOME/.config}"
+  printf '%s\n' "$root/Claude" "$root/claude-desktop" "$root/claude"
+}
+
+pick_claude_dir() {
+  local d
+  if [ -n "${CLAUDE_DIR:-}" ]; then
+    printf '%s' "$CLAUDE_DIR"
+    return 0
+  fi
+  if [ "$OS" = darwin ]; then
+    printf '%s' "$HOME/Library/Application Support/Claude"
+    return 0
+  fi
+  while IFS= read -r d; do
+    if [ -e "$d/config.json" ] || [ -e "$d/Cookies" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done < <(linux_data_dirs)
+  while IFS= read -r d; do
+    if [ -d "$d" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done < <(linux_data_dirs)
+  printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 }
 
 init_paths() {
   detect_os
-  if [ -z "${CLAUDE_DIR:-}" ]; then
-    CLAUDE_DIR="$(default_claude_dir)"
-  fi
+  CLAUDE_DIR="$(pick_claude_dir)"
   SESSIONS_DIR="$CLAUDE_DIR/claude-code-sessions"
 }
 
@@ -62,7 +83,7 @@ init_paths() {
 is_claude_desktop_cmd() {
   local cmd="$1"
   case "$cmd" in
-    *chrome-native-host*|*claude-swap*|*alterclaude*|*pgrep*|*grep*) return 1 ;;
+    *chrome-native-host*|*claude-swap*|*alterclaude*|*pgrep*) return 1 ;;
   esac
   case "$cmd" in
     */Applications/Claude.app/*) return 0 ;;
@@ -70,10 +91,19 @@ is_claude_desktop_cmd() {
     */usr/lib/claude-desktop/*) return 0 ;;
     */opt/claude-desktop/*) return 0 ;;
     */opt/Claude/*) return 0 ;;
+    */usr/lib/Claude/*) return 0 ;;
   esac
   if [ -n "${CLAUDE_BIN:-}" ]; then
     case "$cmd" in *"$CLAUDE_BIN"*) return 0 ;; esac
   fi
+  return 1
+}
+
+is_claude_helper_cmd() {
+  local cmd="$1"
+  case "$cmd" in
+    *--type=*|*crashpad*|*chrome-sandbox*) return 0 ;;
+  esac
   return 1
 }
 
@@ -85,12 +115,24 @@ app_pids() {
       printf '%s\n' "$pid"
     fi
   done < <(ps -eo pid= -o args= 2>/dev/null || true)
+  return 0
+}
+
+app_main_pids() {
+  local pid cmd
+  while read -r pid cmd; do
+    [ -n "${pid:-}" ] || continue
+    if is_claude_desktop_cmd "$cmd" && ! is_claude_helper_cmd "$cmd"; then
+      printf '%s\n' "$pid"
+    fi
+  done < <(ps -eo pid= -o args= 2>/dev/null || true)
+  return 0
 }
 
 wait_app_exit() {
   local i
   for i in $(seq 1 60); do
-    if [ -z "$(app_pids)" ]; then
+    if [ -z "$(app_main_pids)" ]; then
       info "завершилось за $((i / 2)).$(( (i * 5) % 10 )) сек"
       sleep 1
       return
@@ -106,6 +148,10 @@ quit_app_darwin() {
 
 quit_app_linux() {
   local pid
+  for pid in $(app_main_pids); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 0.5
   for pid in $(app_pids); do
     kill -TERM "$pid" 2>/dev/null || true
   done
@@ -140,9 +186,12 @@ resolve_claude_bin() {
   fi
   for c in \
     /usr/lib/claude-desktop/claude-desktop \
+    /usr/lib/claude-desktop/Claude \
     /opt/claude-desktop/claude-desktop \
     /opt/Claude/claude-desktop \
-    /usr/bin/claude-desktop
+    /opt/Claude/Claude \
+    /usr/bin/claude-desktop \
+    /usr/bin/Claude
   do
     if [ -x "$c" ]; then
       printf '%s' "$c"
@@ -152,29 +201,39 @@ resolve_claude_bin() {
   return 1
 }
 
+desktop_file_for() {
+  local name="$1"
+  if [ -f "/usr/share/applications/${name}.desktop" ]; then
+    printf '%s' "/usr/share/applications/${name}.desktop"
+    return 0
+  fi
+  if [ -f "$HOME/.local/share/applications/${name}.desktop" ]; then
+    printf '%s' "$HOME/.local/share/applications/${name}.desktop"
+    return 0
+  fi
+  return 1
+}
+
 start_app_linux() {
-  local bin desktop
+  local bin desktop file
   if [ "$DRY" = 1 ]; then
-    if bin="$(resolve_claude_bin)"; then
-      info "${c_y}[dry-run]${c_0} $bin &"
-    else
-      info "${c_y}[dry-run]${c_0} gtk-launch com.anthropic.Claude"
-    fi
+    info "${c_y}[dry-run]${c_0} gtk-launch com.anthropic.Claude || claude-desktop &"
     return
   fi
+  for desktop in com.anthropic.Claude claude-desktop Claude; do
+    file="$(desktop_file_for "$desktop" || true)"
+    [ -n "$file" ] || continue
+    if command -v gtk-launch >/dev/null 2>&1; then
+      gtk-launch "$desktop" >/dev/null 2>&1 && return
+    fi
+    if command -v gio >/dev/null 2>&1; then
+      gio launch "$file" >/dev/null 2>&1 && return
+    fi
+  done
   if bin="$(resolve_claude_bin)"; then
     nohup "$bin" >/dev/null 2>&1 &
     return
   fi
-  for desktop in com.anthropic.Claude claude-desktop Claude; do
-    if command -v gtk-launch >/dev/null 2>&1 \
-      && { [ -f "/usr/share/applications/${desktop}.desktop" ] \
-        || [ -f "$HOME/.local/share/applications/${desktop}.desktop" ]; }
-    then
-      gtk-launch "$desktop" >/dev/null 2>&1 || true
-      return
-    fi
-  done
   die "не найден claude-desktop. Поставь пакет или задай CLAUDE_BIN=/path/to/bin"
 }
 
@@ -244,11 +303,13 @@ collect_account_uuids() {
   local u file d
   u="$(read_account_uuid "$CLAUDE_DIR/config.json")"
   [ -n "${u:-}" ] && printf '%s\n' "$u"
+  shopt -s nullglob
   for file in "$PROFILES_DIR"/*/config.json; do
     [ -f "$file" ] || continue
     u="$(read_account_uuid "$file")"
     [ -n "${u:-}" ] && printf '%s\n' "$u"
   done
+  shopt -u nullglob
   if [ -d "$SESSIONS_DIR" ]; then
     for d in "$SESSIONS_DIR"/*; do
       [ -e "$d" ] || continue
@@ -313,6 +374,7 @@ cmd_list() {
   local active; active="$(active_profile)"
   printf '%sПрофили:%s  (%s  %s)\n' "$c_b" "$c_0" "$OS" "$CLAUDE_DIR"
   local found=0 d name mark size
+  shopt -s nullglob
   for d in "$PROFILES_DIR"/*/; do
     [ -d "$d" ] || continue
     name="$(basename "$d")"
@@ -322,6 +384,7 @@ cmd_list() {
     size="$(du -sh "$d" 2>/dev/null | cut -f1)"
     printf '  %-14s %6s  %b\n' "$name" "$size" "$mark"
   done
+  shopt -u nullglob
   [ "$found" = 0 ] && printf '  (пусто — начните с: alterclaude init <имя>)\n'
   [ -n "$active" ] && printf '\nАктивный: %s%s%s\n' "$c_g" "$active" "$c_0"
   return 0
@@ -339,10 +402,15 @@ cmd_init() {
 }
 
 cmd_doctor() {
-  local bin="" pids
+  local bin="" pids d
   printf '%sdoctor%s\n' "$c_b" "$c_0"
   info "OS: $OS"
   info "CLAUDE_DIR: $CLAUDE_DIR $([ -d "$CLAUDE_DIR" ] && echo OK || echo MISSING)"
+  if [ "$OS" = linux ]; then
+    while IFS= read -r d; do
+      info "data candidate: $d $([ -d "$d" ] && echo OK || echo —)"
+    done < <(linux_data_dirs)
+  fi
   info "PROFILES_DIR: $PROFILES_DIR"
   if command -v python3 >/dev/null 2>&1; then info "python3: OK"; else info "python3: MISSING"; fi
   if [ "$OS" = linux ]; then
@@ -354,8 +422,8 @@ cmd_doctor() {
   else
     info "app: /Applications/Claude.app $([ -d /Applications/Claude.app ] && echo OK || echo MISSING)"
   fi
-  pids="$(app_pids | tr '\n' ' ')"
-  if [ -n "$pids" ]; then info "running PIDs: $pids"; else info "running: нет"; fi
+  pids="$(app_main_pids | tr '\n' ' ')"
+  if [ -n "$pids" ]; then info "running main PIDs: $pids"; else info "running: нет"; fi
   if [ -n "${CLAUDE_CODE_DESKTOP_APP_VERSION:-}" ]; then
     info "WARNING: запущено изнутри Claude Desktop — switch запрещён"
   fi
